@@ -27,6 +27,9 @@ pub trait Transport {
     /// Sets the device status.
     fn set_status(&mut self, status: DeviceStatus);
 
+    /// Gets the device status.
+    fn get_status(&self) -> DeviceStatus;
+
     /// Sets the guest page size.
     fn set_guest_page_size(&mut self, guest_page_size: u32);
 
@@ -52,12 +55,19 @@ pub trait Transport {
     ///
     /// Ref: virtio 3.1.1 Device Initialization
     fn begin_init(&mut self, negotiate_features: impl FnOnce(u64) -> u64) {
+        self.set_status(DeviceStatus::RESET);
+        self.set_status(DeviceStatus::ACKNOWLEDGE);
         self.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
 
         let features = self.read_device_features();
         self.write_driver_features(negotiate_features(features));
         self.set_status(
             DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK,
+        );
+        let new_status = self.get_status();
+        assert!(
+            (new_status & DeviceStatus::FEATURES_OK).bits() != 0,
+            "the device does not support our subset of features and the device is unusable"
         );
 
         self.set_guest_page_size(PAGE_SIZE as u32);
@@ -81,6 +91,9 @@ bitflags! {
     /// The device status field.
     #[derive(Default)]
     pub struct DeviceStatus: u32 {
+        /// Reset the device.
+        const RESET = 0;
+
         /// Indicates that the guest OS has found the device and recognized it
         /// as a valid virtio device.
         const ACKNOWLEDGE = 1;

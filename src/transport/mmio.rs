@@ -355,6 +355,11 @@ impl Transport for MmioTransport {
         }
     }
 
+    fn get_status(&self) -> DeviceStatus {
+        // Safe because self.header points to a valid VirtIO MMIO region.
+        unsafe { volread!(self.header, status) }
+    }
+
     fn set_guest_page_size(&mut self, guest_page_size: u32) {
         match self.version {
             MmioVersion::Legacy => {

@@ -75,9 +75,16 @@ impl<H: Hal, T: Transport> VirtIONet<H, T> {
 
     /// Receive a packet.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let mut header = MaybeUninit::<Header>::uninit();
-        let header_buf = unsafe { (*header.as_mut_ptr()).as_buf_mut() };
-        self.recv_queue.add(&[], &[header_buf, buf])?;
+        static mut header_buf: Option<&mut [u8]> = None;
+        if unsafe { header_buf.is_none() } {
+            let dma_page = H::dma_alloc(1);
+            let vaddr_dma_page = H::phys_to_virt(dma_page);
+            unsafe {
+                header_buf = Some(core::slice::from_raw_parts_mut(vaddr_dma_page as *mut u8, core::mem::size_of::<Header>()));
+            }
+        }
+
+        self.recv_queue.add(&[], &[unsafe { header_buf.as_mut().unwrap() }, buf])?;
         self.transport.notify(QUEUE_RECEIVE);
         while !self.recv_queue.can_pop() {
             spin_loop();
@@ -90,8 +97,16 @@ impl<H: Hal, T: Transport> VirtIONet<H, T> {
 
     /// Send a packet.
     pub fn send(&mut self, buf: &[u8]) -> Result {
-        let header = unsafe { MaybeUninit::<Header>::zeroed().assume_init() };
-        self.send_queue.add(&[header.as_buf(), buf], &[])?;
+        static mut header_buf: Option<&mut [u8]> = None;
+        if unsafe { header_buf.is_none() } {
+            let dma_page = H::dma_alloc(1);
+            let vaddr_dma_page = H::phys_to_virt(dma_page);
+            unsafe {
+                header_buf = Some(core::slice::from_raw_parts_mut(vaddr_dma_page as *mut u8, core::mem::size_of::<Header>()));
+            }
+        }
+
+        self.send_queue.add(&[unsafe { header_buf.as_mut().unwrap() }, buf], &[])?;
         self.transport.notify(QUEUE_TRANSMIT);
         while !self.send_queue.can_pop() {
             spin_loop();

@@ -259,6 +259,11 @@ impl Transport for PciTransport {
         }
     }
 
+    fn get_status(&self) -> DeviceStatus {
+        let status = unsafe { volread!(self.common_cfg, device_status) };
+        DeviceStatus::from_bits(status as u32).unwrap()
+    }
+
     fn set_guest_page_size(&mut self, _guest_page_size: u32) {
         // No-op, the PCI transport doesn't care.
     }
