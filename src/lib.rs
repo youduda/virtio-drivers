@@ -16,10 +16,10 @@ mod hal;
 #[cfg(feature = "alloc")]
 mod input;
 mod net;
-mod vsock;
 mod queue;
 mod transport;
 mod volatile;
+mod vsock;
 
 pub use self::blk::{BlkResp, RespStatus, VirtIOBlk};
 pub use self::console::VirtIOConsole;
@@ -32,6 +32,7 @@ use self::queue::VirtQueue;
 pub use self::transport::mmio::{MmioError, MmioTransport, MmioVersion, VirtIOHeader};
 pub use self::transport::pci;
 pub use self::transport::{DeviceStatus, DeviceType, Transport};
+pub use self::vsock::VirtIOVsock;
 use core::mem::size_of;
 use hal::*;
 
