@@ -75,38 +75,43 @@ impl<H: Hal, T: Transport> VirtIONet<H, T> {
 
     /// Receive a packet.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-        static mut header_buf: Option<&mut [u8]> = None;
-        if unsafe { header_buf.is_none() } {
+        static mut header: Option<*mut Header> = None;
+        if unsafe { header.is_none() } {
             let dma_page = H::dma_alloc(1);
             let vaddr_dma_page = H::phys_to_virt(dma_page);
             unsafe {
-                header_buf = Some(core::slice::from_raw_parts_mut(vaddr_dma_page as *mut u8, core::mem::size_of::<Header>()));
+                header = Some(vaddr_dma_page as *mut Header);
             }
         }
+        let header_buf = unsafe {
+            (**header.as_ref().unwrap()).as_buf_mut()
+        };
 
-        self.recv_queue.add(&[], &[unsafe { header_buf.as_mut().unwrap() }, buf])?;
+        self.recv_queue.add(&[], &[header_buf, buf])?;
         self.transport.notify(QUEUE_RECEIVE);
         while !self.recv_queue.can_pop() {
             spin_loop();
         }
 
         let (_, len) = self.recv_queue.pop_used()?;
-        // let header = unsafe { header.assume_init() };
         Ok(len as usize - size_of::<Header>())
     }
 
     /// Send a packet.
     pub fn send(&mut self, buf: &[u8]) -> Result {
-        static mut header_buf: Option<&mut [u8]> = None;
-        if unsafe { header_buf.is_none() } {
+        static mut header: Option<*mut Header> = None;
+        if unsafe { header.is_none() } {
             let dma_page = H::dma_alloc(1);
             let vaddr_dma_page = H::phys_to_virt(dma_page);
             unsafe {
-                header_buf = Some(core::slice::from_raw_parts_mut(vaddr_dma_page as *mut u8, core::mem::size_of::<Header>()));
+                header = Some(vaddr_dma_page as *mut Header);
             }
         }
+        let header_buf = unsafe {
+            (**header.as_ref().unwrap()).as_buf()
+        };
 
-        self.send_queue.add(&[unsafe { header_buf.as_mut().unwrap() }, buf], &[])?;
+        self.send_queue.add(&[header_buf, buf], &[])?;
         self.transport.notify(QUEUE_TRANSMIT);
         while !self.send_queue.can_pop() {
             spin_loop();
