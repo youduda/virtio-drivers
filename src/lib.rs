@@ -16,6 +16,7 @@ mod hal;
 #[cfg(feature = "alloc")]
 mod input;
 mod net;
+mod vsock;
 mod queue;
 mod transport;
 mod volatile;
