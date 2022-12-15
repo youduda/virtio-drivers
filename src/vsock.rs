@@ -233,6 +233,12 @@ bitflags! {
     }
 }
 
+impl Default for Flags {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 // virtio 5.10.2 Virtqueues
 const QUEUE_RECEIVE: u16 = 0;
 const QUEUE_TRANSMIT: u16 = 1;
