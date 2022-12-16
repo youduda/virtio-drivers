@@ -8,6 +8,15 @@ use core::hint::spin_loop;
 use core::ptr::NonNull;
 use log::*;
 
+const DATA_BUF_SIZE: usize = 0x100;
+
+#[repr(transparent)]
+struct DataBuf {
+    data: [u8; DATA_BUF_SIZE],
+}
+
+unsafe impl AsBuf for DataBuf {}
+
 /// The Virtio Vsock device is a virtual socket.
 ///
 /// It has enhanced rapidly and demonstrates clearly how support for new
@@ -22,6 +31,8 @@ pub struct VirtIOVsock<H: Hal, T: Transport> {
     send_queue: VirtQueue<H>,
     event_queue: VirtQueue<H>,
     header_buf: NonNull<Header>,
+    data_buf: NonNull<DataBuf>,
+    fwd_cnt: u32,
 }
 
 impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
@@ -30,7 +41,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         transport.begin_init(|features| {
             let features = Features::from_bits_truncate(features);
             info!("Device features {:?}", features);
-            let supported_features = Features::VIRTIO_VSOCK_F_SEQPACKET;
+            let supported_features = Features::VIRTIO_VSOCK_F_STREAM;
             (features & supported_features).bits()
         });
         // read configuration space
@@ -53,7 +64,9 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         // Allocate a single page for the header buffer. This is used during send and recv.
         let dma_page = H::dma_alloc(1);
         let vaddr_dma_page = H::phys_to_virt(dma_page);
-        let header_buf = NonNull::new(vaddr_dma_page as *mut Header)
+        let data_buf =
+            NonNull::new(vaddr_dma_page as *mut DataBuf).expect("Allocation of data buffer failed");
+        let header_buf = NonNull::new((vaddr_dma_page + size_of::<DataBuf>()) as *mut Header)
             .expect("Allocation of header buffer failed");
 
         Ok(VirtIOVsock {
@@ -63,6 +76,8 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
             send_queue,
             event_queue,
             header_buf,
+            data_buf,
+            fwd_cnt: 0,
         })
     }
 
@@ -88,7 +103,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
 
     /// Receive a packet.
     /// Returns a tuple (src_cid, src_port, dst_port, buf_len)
-    pub fn recv(&mut self, buf: &mut [u8]) -> Result<(u64, u32, u32, usize)> {
+    fn recv_int(&mut self, buf: &mut [u8]) -> Result<(u64, u32, u32, usize)> {
         // Note: `header_buf` and `self.header_buf` point to the same memory address
         let header_buf = unsafe { self.header_buf.as_mut().as_buf_mut() };
 
@@ -97,6 +112,8 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         while !self.recv_queue.can_pop() {
             spin_loop();
         }
+        let (_, len) = self.recv_queue.pop_used()?;
+        self.fwd_cnt += len;
 
         let dst_cid = unsafe { volread!(self.header_buf, dst_cid) };
         assert_eq!(
@@ -105,7 +122,6 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         );
         // TODO: virtio 5.10.6.3: A VIRTIO_VSOCK_OP_RST reply MUST be sent if a packet is received with an unknown type
 
-        let (_, len) = self.recv_queue.pop_used()?;
         Ok((
             unsafe { volread!(self.header_buf, src_cid) },
             unsafe { volread!(self.header_buf, src_port) },
@@ -114,16 +130,34 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         ))
     }
 
+    /// Receive a packet.
+    /// Returns a tuple (src_cid, src_port, dst_port, buf_len)
+    pub fn recv(&mut self, buf: &mut [u8]) -> Result<(u64, u32, u32, usize)> {
+        let res = self.recv_int(buf);
+        assert_eq!(
+            unsafe { volread!(self.header_buf, op) },
+            Op::VIRTIO_VSOCK_OP_RW
+        );
+        res
+    }
+
     /// Send a packet.
-    pub fn send(&mut self, src_port: u32, dst_cid: u64, dst_port: u32, buf: &[u8]) -> Result {
+    fn send_int(&mut self, src_port: u32, dst_cid: u64, dst_port: u32, buf: &[u8]) -> Result {
         // Note: `header_buf` and `self.header_buf` point to the same memory address
         let header_buf = unsafe { self.header_buf.as_mut().as_buf_mut() };
+
         unsafe {
-            core::ptr::write_volatile(self.header_buf.as_ptr(), Header::default());
             volwrite!(self.header_buf, src_cid, self.guest_cid);
             volwrite!(self.header_buf, src_port, src_port);
             volwrite!(self.header_buf, dst_cid, dst_cid);
             volwrite!(self.header_buf, dst_port, dst_port);
+
+            volwrite!(self.header_buf, len, buf.len() as u32);
+            volwrite!(self.header_buf, type_, Type::VIRTIO_VSOCK_TYPE_STREAM);
+            volwrite!(self.header_buf, flags, Flags::empty());
+
+            volwrite!(self.header_buf, buf_alloc, 0x1000);
+            volwrite!(self.header_buf, fwd_cnt, self.fwd_cnt);
         }
 
         self.send_queue.add(&[header_buf, buf], &[])?;
@@ -135,9 +169,44 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         Ok(())
     }
 
+    pub fn send(&mut self, src_port: u32, dst_cid: u64, dst_port: u32, buf: &[u8]) -> Result {
+        unsafe {
+            volwrite!(self.header_buf, op, Op::VIRTIO_VSOCK_OP_RW);
+        }
+
+        self.send_int(src_port, dst_cid, dst_port, buf)
+    }
+
     pub fn recv_event() {
         // virtio 5.10.6.7
         todo!()
+    }
+
+    /// Listen for a new incomming connection
+    pub fn accept(&mut self) -> Result {
+        trace!("Accepting connection");
+
+        let data_buf = unsafe { self.data_buf.as_mut().as_buf_mut() };
+        let (src_cid, src_port, dst_port, buf_len) = self.recv_int(data_buf)?;
+
+        debug_assert_eq!(
+            unsafe { volread!(self.header_buf, type_) },
+            Type::VIRTIO_VSOCK_TYPE_STREAM
+        );
+        assert_eq!(
+            unsafe { volread!(self.header_buf, op) },
+            Op::VIRTIO_VSOCK_OP_REQUEST
+        );
+        trace!("Received connection request");
+
+        unsafe {
+            volwrite!(self.header_buf, op, Op::VIRTIO_VSOCK_OP_RESPONSE);
+        }
+        self.send_int(dst_port, src_cid, src_port, data_buf)?;
+
+        trace!("Accepted connection");
+
+        Ok(())
     }
 }
 
@@ -171,7 +240,8 @@ struct Config {
 }
 
 // virtio 5.1.6 Device Operation
-#[repr(C)]
+// TODO: `packed` should not be needed. Looks like a compiler bug or other changes in newer Rust versions fixing this
+#[repr(C, packed)]
 #[derive(Debug, Default)]
 struct Header {
     src_cid: Volatile<u64>,
