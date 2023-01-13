@@ -9,7 +9,7 @@ use core::ptr::NonNull;
 use log::*;
 
 // TODO: PAGE_SIZE - size_of::<Header>()
-const DATA_BUF_SIZE: usize = 0x500;
+pub const DATA_BUF_SIZE: usize = 0x500;
 
 #[repr(transparent)]
 struct DataBuf {
@@ -212,7 +212,11 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
 
     /// Accepts incomming connections, receives incomming data
     /// Returns a tuple (operation, src_cid, src_port, dst_port, buf_len)
-    pub fn handle_next(&mut self, buf: &mut [u8], blocking: bool) -> Result<(VSockOp, u64, u32, u32, usize)> {
+    pub fn handle_next(
+        &mut self,
+        buf: &mut [u8],
+        blocking: bool,
+    ) -> Result<(VSockOp, u64, u32, u32, usize)> {
         trace!("Handle next incomming frame");
         let data_buf = unsafe { self.data_buf.as_ref().as_buf() };
         debug_assert!(buf.len() >= data_buf.len());
@@ -229,11 +233,11 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
             Op::VIRTIO_VSOCK_OP_RW => {
                 buf[..buf_len].copy_from_slice(&data_buf[..buf_len]);
                 Ok((VSockOp::DataFrame, src_cid, src_port, dst_port, buf_len))
-            },
+            }
             Op::VIRTIO_VSOCK_OP_REQUEST => {
                 self.accept(src_cid, src_port, dst_port);
                 Ok((VSockOp::Accepted, src_cid, src_port, dst_port, 0))
-            },
+            }
             _ => todo!(),
         }
     }

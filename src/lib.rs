@@ -32,7 +32,7 @@ use self::queue::VirtQueue;
 pub use self::transport::mmio::{MmioError, MmioTransport, MmioVersion, VirtIOHeader};
 pub use self::transport::pci;
 pub use self::transport::{DeviceStatus, DeviceType, Transport};
-pub use self::vsock::VirtIOVsock;
+pub use self::vsock::{VSockOp, VirtIOVsock, DATA_BUF_SIZE};
 use core::mem::size_of;
 use hal::*;
 
