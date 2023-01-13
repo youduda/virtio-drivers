@@ -8,7 +8,8 @@ use core::hint::spin_loop;
 use core::ptr::NonNull;
 use log::*;
 
-const DATA_BUF_SIZE: usize = 0x100;
+// TODO: PAGE_SIZE - size_of::<Header>()
+const DATA_BUF_SIZE: usize = 0x500;
 
 #[repr(transparent)]
 struct DataBuf {
@@ -33,6 +34,7 @@ pub struct VirtIOVsock<H: Hal, T: Transport> {
     header_buf: NonNull<Header>,
     data_buf: NonNull<DataBuf>,
     fwd_cnt: u32,
+    queue_filled: bool,
 }
 
 impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
@@ -78,6 +80,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
             header_buf,
             data_buf,
             fwd_cnt: 0,
+            queue_filled: false,
         })
     }
 
@@ -101,14 +104,24 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         self.recv_queue.can_pop()
     }
 
+    fn recv_init(&mut self) -> Result {
+        if self.queue_filled {
+            return Ok(());
+        }
+        // Note: `header_buf` and `self.header_buf` point to the same memory address. Same for `data_buf`
+        let header_buf = unsafe { self.header_buf.as_mut().as_buf_mut() };
+        let data_buf = unsafe { self.data_buf.as_mut().as_buf_mut() };
+
+        self.recv_queue.add(&[], &[header_buf, data_buf])?;
+        self.transport.notify(QUEUE_RECEIVE);
+        Ok(())
+    }
+
     /// Receive a packet.
     /// Returns a tuple (src_cid, src_port, dst_port, buf_len)
-    fn recv_int(&mut self, buf: &mut [u8]) -> Result<(u64, u32, u32, usize)> {
-        // Note: `header_buf` and `self.header_buf` point to the same memory address
-        let header_buf = unsafe { self.header_buf.as_mut().as_buf_mut() };
-
-        self.recv_queue.add(&[], &[header_buf, buf])?;
-        self.transport.notify(QUEUE_RECEIVE);
+    fn recv_frame(&mut self) -> Result<(u64, u32, u32, usize)> {
+        assert!(self.queue_filled);
+        self.queue_filled = false;
         while !self.recv_queue.can_pop() {
             spin_loop();
         }
@@ -128,17 +141,6 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
             unsafe { volread!(self.header_buf, dst_port) },
             len as usize - size_of::<Header>(),
         ))
-    }
-
-    /// Receive a packet.
-    /// Returns a tuple (src_cid, src_port, dst_port, buf_len)
-    pub fn recv(&mut self, buf: &mut [u8]) -> Result<(u64, u32, u32, usize)> {
-        let res = self.recv_int(buf);
-        assert_eq!(
-            unsafe { volread!(self.header_buf, op) },
-            Op::VIRTIO_VSOCK_OP_RW
-        );
-        res
     }
 
     /// Send a packet.
@@ -183,17 +185,16 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
     }
 
     /// Listen for a new incomming connection
-    pub fn accept(&mut self) -> Result {
+    fn accept(&mut self, src_cid: u64, src_port: u32, dst_port: u32) -> Result {
         trace!("Accepting connection");
 
         let data_buf = unsafe { self.data_buf.as_mut().as_buf_mut() };
-        let (src_cid, src_port, dst_port, buf_len) = self.recv_int(data_buf)?;
 
         debug_assert_eq!(
             unsafe { volread!(self.header_buf, type_) },
             Type::VIRTIO_VSOCK_TYPE_STREAM
         );
-        assert_eq!(
+        debug_assert_eq!(
             unsafe { volread!(self.header_buf, op) },
             Op::VIRTIO_VSOCK_OP_REQUEST
         );
@@ -208,6 +209,40 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
 
         Ok(())
     }
+
+    /// Accepts incomming connections, receives incomming data
+    /// Returns a tuple (operation, src_cid, src_port, dst_port, buf_len)
+    pub fn handle_next(&mut self, buf: &mut [u8], blocking: bool) -> Result<(VSockOp, u64, u32, u32, usize)> {
+        trace!("Handle next incomming frame");
+        let data_buf = unsafe { self.data_buf.as_ref().as_buf() };
+        debug_assert!(buf.len() >= data_buf.len());
+
+        self.recv_init()?;
+        if !blocking && !self.can_recv() {
+            return Ok((VSockOp::WouldBlock, 0, 0, 0, 0));
+        }
+        let (src_cid, src_port, dst_port, buf_len) = self.recv_frame()?;
+        let op = unsafe { volread!(self.header_buf, op) };
+        let type_ = unsafe { volread!(self.header_buf, type_) };
+
+        match op {
+            Op::VIRTIO_VSOCK_OP_RW => {
+                buf[..buf_len].copy_from_slice(&data_buf[..buf_len]);
+                Ok((VSockOp::DataFrame, src_cid, src_port, dst_port, buf_len))
+            },
+            Op::VIRTIO_VSOCK_OP_REQUEST => {
+                self.accept(src_cid, src_port, dst_port);
+                Ok((VSockOp::Accepted, src_cid, src_port, dst_port, 0))
+            },
+            _ => todo!(),
+        }
+    }
+}
+
+pub enum VSockOp {
+    Accepted,
+    DataFrame,
+    WouldBlock,
 }
 
 // virtio 5.10.3 Feature bits
