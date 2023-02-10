@@ -8,12 +8,12 @@ use core::hint::spin_loop;
 use core::ptr::NonNull;
 use log::*;
 
-// TODO: PAGE_SIZE - size_of::<Header>()
-pub const DATA_BUF_SIZE: usize = 0x500;
+// TODO: ( PAGE_SIZE - size_of::<Header>() * 2 ) / 2
+pub const SEND_RECV_DATA_BUF_SIZE: usize = 0x700;
 
 #[repr(transparent)]
 struct DataBuf {
-    data: [u8; DATA_BUF_SIZE],
+    data: [u8; SEND_RECV_DATA_BUF_SIZE],
 }
 
 unsafe impl AsBuf for DataBuf {}
@@ -31,8 +31,10 @@ pub struct VirtIOVsock<H: Hal, T: Transport> {
     recv_queue: VirtQueue<H>,
     send_queue: VirtQueue<H>,
     event_queue: VirtQueue<H>,
-    header_buf: NonNull<Header>,
-    data_buf: NonNull<DataBuf>,
+    send_header_buf: NonNull<Header>,
+    recv_header_buf: NonNull<Header>,
+    send_data_buf: NonNull<DataBuf>,
+    recv_data_buf: NonNull<DataBuf>,
     fwd_cnt: u32,
     queue_filled: bool,
 }
@@ -66,10 +68,17 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         // Allocate a single page for the header buffer. This is used during send and recv.
         let dma_page = H::dma_alloc(1);
         let vaddr_dma_page = H::phys_to_virt(dma_page);
-        let data_buf =
+        let recv_data_buf =
             NonNull::new(vaddr_dma_page as *mut DataBuf).expect("Allocation of data buffer failed");
-        let header_buf = NonNull::new((vaddr_dma_page + size_of::<DataBuf>()) as *mut Header)
-            .expect("Allocation of header buffer failed");
+        let send_data_buf = NonNull::new((vaddr_dma_page + size_of::<DataBuf>()) as *mut DataBuf)
+            .expect("Allocation of data buffer failed");
+        let send_header_buf =
+            NonNull::new((vaddr_dma_page + size_of::<DataBuf>() * 2) as *mut Header)
+                .expect("Allocation of header buffer failed");
+        let recv_header_buf = NonNull::new(
+            (vaddr_dma_page + size_of::<DataBuf>() * 2 + size_of::<Header>()) as *mut Header,
+        )
+        .expect("Allocation of header buffer failed");
 
         Ok(VirtIOVsock {
             transport,
@@ -77,8 +86,10 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
             recv_queue,
             send_queue,
             event_queue,
-            header_buf,
-            data_buf,
+            send_header_buf,
+            recv_header_buf,
+            send_data_buf,
+            recv_data_buf,
             fwd_cnt: 0,
             queue_filled: false,
         })
@@ -109,11 +120,12 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
             return Ok(());
         }
         self.queue_filled = true;
-        // Note: `header_buf` and `self.header_buf` point to the same memory address. Same for `data_buf`
-        let header_buf = unsafe { self.header_buf.as_mut().as_buf_mut() };
-        let data_buf = unsafe { self.data_buf.as_mut().as_buf_mut() };
+        // Note: `header_buf` and `self.header_buf` point to the same memory address. Same for `recv_data_buf`
+        let recv_header_buf = unsafe { self.recv_header_buf.as_mut().as_buf_mut() };
+        let recv_data_buf = unsafe { self.recv_data_buf.as_mut().as_buf_mut() };
 
-        self.recv_queue.add(&[], &[header_buf, data_buf])?;
+        self.recv_queue
+            .add(&[], &[recv_header_buf, recv_data_buf])?;
         self.transport.notify(QUEUE_RECEIVE);
         Ok(())
     }
@@ -129,7 +141,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         let (_, len) = self.recv_queue.pop_used()?;
         self.fwd_cnt += len;
 
-        let dst_cid = unsafe { volread!(self.header_buf, dst_cid) };
+        let dst_cid = unsafe { volread!(self.recv_header_buf, dst_cid) };
         assert_eq!(
             dst_cid, self.guest_cid,
             "TODO: What to to if received frame has different dst_cid"
@@ -137,33 +149,34 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         // TODO: virtio 5.10.6.3: A VIRTIO_VSOCK_OP_RST reply MUST be sent if a packet is received with an unknown type
 
         Ok((
-            unsafe { volread!(self.header_buf, src_cid) },
-            unsafe { volread!(self.header_buf, src_port) },
-            unsafe { volread!(self.header_buf, dst_port) },
+            unsafe { volread!(self.recv_header_buf, src_cid) },
+            unsafe { volread!(self.recv_header_buf, src_port) },
+            unsafe { volread!(self.recv_header_buf, dst_port) },
             len as usize - size_of::<Header>(),
         ))
     }
 
     /// Send a packet.
-    fn send_int(&mut self, src_port: u32, dst_cid: u64, dst_port: u32, buf: &[u8]) -> Result {
+    fn send_int(&mut self, src_port: u32, dst_cid: u64, dst_port: u32, buf_len: usize) -> Result {
         // Note: `header_buf` and `self.header_buf` point to the same memory address
-        let header_buf = unsafe { self.header_buf.as_mut().as_buf_mut() };
+        let header_buf = unsafe { self.send_header_buf.as_mut().as_buf_mut() };
 
         unsafe {
-            volwrite!(self.header_buf, src_cid, self.guest_cid);
-            volwrite!(self.header_buf, src_port, src_port);
-            volwrite!(self.header_buf, dst_cid, dst_cid);
-            volwrite!(self.header_buf, dst_port, dst_port);
+            volwrite!(self.send_header_buf, src_cid, self.guest_cid);
+            volwrite!(self.send_header_buf, src_port, src_port);
+            volwrite!(self.send_header_buf, dst_cid, dst_cid);
+            volwrite!(self.send_header_buf, dst_port, dst_port);
 
-            volwrite!(self.header_buf, len, buf.len() as u32);
-            volwrite!(self.header_buf, type_, Type::VIRTIO_VSOCK_TYPE_STREAM);
-            volwrite!(self.header_buf, flags, Flags::empty());
+            volwrite!(self.send_header_buf, len, buf_len as u32);
+            volwrite!(self.send_header_buf, type_, Type::VIRTIO_VSOCK_TYPE_STREAM);
+            volwrite!(self.send_header_buf, flags, Flags::empty());
 
-            volwrite!(self.header_buf, buf_alloc, 0x1000);
-            volwrite!(self.header_buf, fwd_cnt, self.fwd_cnt);
+            volwrite!(self.send_header_buf, buf_alloc, 0x1000);
+            volwrite!(self.send_header_buf, fwd_cnt, self.fwd_cnt);
         }
 
-        self.send_queue.add(&[header_buf, buf], &[])?;
+        let send_data_buf = unsafe { self.send_data_buf.as_ref().as_buf() };
+        self.send_queue.add(&[header_buf, send_data_buf], &[])?;
         self.transport.notify(QUEUE_TRANSMIT);
         while !self.send_queue.can_pop() {
             spin_loop();
@@ -173,11 +186,14 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
     }
 
     pub fn send(&mut self, src_port: u32, dst_cid: u64, dst_port: u32, buf: &[u8]) -> Result {
+        let send_data_buf = unsafe { self.send_data_buf.as_mut().as_buf_mut() };
+        debug_assert!(buf.len() <= send_data_buf.len());
+        send_data_buf[..buf.len()].copy_from_slice(buf);
         unsafe {
-            volwrite!(self.header_buf, op, Op::VIRTIO_VSOCK_OP_RW);
+            volwrite!(self.send_header_buf, op, Op::VIRTIO_VSOCK_OP_RW);
         }
 
-        self.send_int(src_port, dst_cid, dst_port, buf)
+        self.send_int(src_port, dst_cid, dst_port, buf.len())
     }
 
     pub fn recv_event() {
@@ -189,22 +205,18 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
     fn accept(&mut self, src_cid: u64, src_port: u32, dst_port: u32) -> Result {
         trace!("Accepting connection");
 
-        let data_buf = unsafe { self.data_buf.as_mut().as_buf_mut() };
+        let recv_data_buf = unsafe { self.recv_data_buf.as_mut().as_buf_mut() };
 
-        debug_assert_eq!(
-            unsafe { volread!(self.header_buf, type_) },
-            Type::VIRTIO_VSOCK_TYPE_STREAM
-        );
-        debug_assert_eq!(
-            unsafe { volread!(self.header_buf, op) },
-            Op::VIRTIO_VSOCK_OP_REQUEST
-        );
+        let frame_type = unsafe { volread!(self.recv_header_buf, type_) };
+        debug_assert_eq!(frame_type, Type::VIRTIO_VSOCK_TYPE_STREAM);
+        let frame_op = unsafe { volread!(self.recv_header_buf, op) };
+        debug_assert_eq!(frame_op, Op::VIRTIO_VSOCK_OP_REQUEST);
         trace!("Received connection request");
 
         unsafe {
-            volwrite!(self.header_buf, op, Op::VIRTIO_VSOCK_OP_RESPONSE);
+            volwrite!(self.send_header_buf, op, Op::VIRTIO_VSOCK_OP_RESPONSE);
         }
-        self.send_int(dst_port, src_cid, src_port, data_buf)?;
+        self.send_int(dst_port, src_cid, src_port, 0)?;
 
         trace!("Accepted connection");
 
@@ -218,20 +230,20 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         buf: &mut [u8],
         blocking: bool,
     ) -> Result<(VSockOp, u64, u32, u32, usize)> {
-        let data_buf = unsafe { self.data_buf.as_ref().as_buf() };
-        debug_assert!(buf.len() >= data_buf.len());
+        let recv_data_buf = unsafe { self.recv_data_buf.as_ref().as_buf() };
+        debug_assert!(buf.len() >= recv_data_buf.len());
 
         self.recv_init()?;
         if !blocking && !self.can_recv() {
             return Ok((VSockOp::WouldBlock, 0, 0, 0, 0));
         }
         let (src_cid, src_port, dst_port, buf_len) = self.recv_frame()?;
-        let op = unsafe { volread!(self.header_buf, op) };
-        let type_ = unsafe { volread!(self.header_buf, type_) };
+        let op = unsafe { volread!(self.recv_header_buf, op) };
+        let type_ = unsafe { volread!(self.recv_header_buf, type_) };
 
         match op {
             Op::VIRTIO_VSOCK_OP_RW => {
-                buf[..buf_len].copy_from_slice(&data_buf[..buf_len]);
+                buf[..buf_len].copy_from_slice(&recv_data_buf[..buf_len]);
                 Ok((VSockOp::DataFrame, src_cid, src_port, dst_port, buf_len))
             }
             Op::VIRTIO_VSOCK_OP_REQUEST => {
