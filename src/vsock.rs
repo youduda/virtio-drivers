@@ -218,7 +218,6 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         buf: &mut [u8],
         blocking: bool,
     ) -> Result<(VSockOp, u64, u32, u32, usize)> {
-        trace!("Handle next incoming frame");
         let data_buf = unsafe { self.data_buf.as_ref().as_buf() };
         debug_assert!(buf.len() >= data_buf.len());
 
