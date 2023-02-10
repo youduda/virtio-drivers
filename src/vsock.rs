@@ -10,6 +10,7 @@ use log::*;
 
 // TODO: ( PAGE_SIZE - size_of::<Header>() * 2 ) / 2
 pub const SEND_RECV_DATA_BUF_SIZE: usize = 0x700;
+const ASSUMED_HEADER_MAX_SIZE: usize = 0x100;
 
 #[repr(transparent)]
 struct DataBuf {
@@ -68,15 +69,19 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         // Allocate a single page for the header buffer. This is used during send and recv.
         let dma_page = H::dma_alloc(1);
         let vaddr_dma_page = H::phys_to_virt(dma_page);
-        let recv_data_buf =
+        let send_data_buf =
             NonNull::new(vaddr_dma_page as *mut DataBuf).expect("Allocation of data buffer failed");
-        let send_data_buf = NonNull::new((vaddr_dma_page + size_of::<DataBuf>()) as *mut DataBuf)
+        let recv_data_buf = NonNull::new((vaddr_dma_page + size_of::<DataBuf>()) as *mut DataBuf)
             .expect("Allocation of data buffer failed");
+
+        assert!(size_of::<Header>() <= ASSUMED_HEADER_MAX_SIZE);
+        // We assume the header size here because the assigned DMA memory must be correctly alligned and the header size is unknown,
+        // but an upper cap is required for all the buffers to fit into one DMA page
         let send_header_buf =
             NonNull::new((vaddr_dma_page + size_of::<DataBuf>() * 2) as *mut Header)
                 .expect("Allocation of header buffer failed");
         let recv_header_buf = NonNull::new(
-            (vaddr_dma_page + size_of::<DataBuf>() * 2 + size_of::<Header>()) as *mut Header,
+            (vaddr_dma_page + size_of::<DataBuf>() * 2 + ASSUMED_HEADER_MAX_SIZE) as *mut Header,
         )
         .expect("Allocation of header buffer failed");
 
@@ -159,7 +164,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
     /// Send a packet.
     fn send_int(&mut self, src_port: u32, dst_cid: u64, dst_port: u32, buf_len: usize) -> Result {
         // Note: `header_buf` and `self.header_buf` point to the same memory address
-        let header_buf = unsafe { self.send_header_buf.as_mut().as_buf_mut() };
+        let send_header_buf = unsafe { self.send_header_buf.as_mut().as_buf_mut() };
 
         unsafe {
             volwrite!(self.send_header_buf, src_cid, self.guest_cid);
@@ -176,7 +181,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         }
 
         let send_data_buf = unsafe { self.send_data_buf.as_ref().as_buf() };
-        self.send_queue.add(&[header_buf, send_data_buf], &[])?;
+        self.send_queue.add(&[send_header_buf, send_data_buf], &[])?;
         self.transport.notify(QUEUE_TRANSMIT);
         while !self.send_queue.can_pop() {
             spin_loop();
@@ -202,21 +207,14 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
     }
 
     /// Listen for a new incoming connection
-    fn accept(&mut self, src_cid: u64, src_port: u32, dst_port: u32) -> Result {
+    fn send_accept(&mut self, src_cid: u64, src_port: u32, dst_port: u32) -> Result {
         trace!("Accepting connection");
-
-        let recv_data_buf = unsafe { self.recv_data_buf.as_mut().as_buf_mut() };
-
-        let frame_type = unsafe { volread!(self.recv_header_buf, type_) };
-        debug_assert_eq!(frame_type, Type::VIRTIO_VSOCK_TYPE_STREAM);
-        let frame_op = unsafe { volread!(self.recv_header_buf, op) };
-        debug_assert_eq!(frame_op, Op::VIRTIO_VSOCK_OP_REQUEST);
-        trace!("Received connection request");
 
         unsafe {
             volwrite!(self.send_header_buf, op, Op::VIRTIO_VSOCK_OP_RESPONSE);
         }
-        self.send_int(dst_port, src_cid, src_port, 0)?;
+        let send_header_buf = unsafe { self.send_header_buf.as_mut().as_buf_mut() };
+        self.send_int(dst_port, src_cid, src_port, send_header_buf.len())?;
 
         trace!("Accepted connection");
 
@@ -240,6 +238,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         let (src_cid, src_port, dst_port, buf_len) = self.recv_frame()?;
         let op = unsafe { volread!(self.recv_header_buf, op) };
         let type_ = unsafe { volread!(self.recv_header_buf, type_) };
+        debug_assert_eq!(type_, Type::VIRTIO_VSOCK_TYPE_STREAM);
 
         match op {
             Op::VIRTIO_VSOCK_OP_RW => {
@@ -247,7 +246,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
                 Ok((VSockOp::DataFrame, src_cid, src_port, dst_port, buf_len))
             }
             Op::VIRTIO_VSOCK_OP_REQUEST => {
-                self.accept(src_cid, src_port, dst_port);
+                self.send_accept(src_cid, src_port, dst_port);
                 Ok((VSockOp::Accepted, src_cid, src_port, dst_port, 0))
             }
             _ => todo!(),
