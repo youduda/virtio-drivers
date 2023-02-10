@@ -108,6 +108,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         if self.queue_filled {
             return Ok(());
         }
+        self.queue_filled = true;
         // Note: `header_buf` and `self.header_buf` point to the same memory address. Same for `data_buf`
         let header_buf = unsafe { self.header_buf.as_mut().as_buf_mut() };
         let data_buf = unsafe { self.data_buf.as_mut().as_buf_mut() };
