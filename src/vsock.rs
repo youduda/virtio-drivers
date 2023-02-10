@@ -185,7 +185,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         todo!()
     }
 
-    /// Listen for a new incomming connection
+    /// Listen for a new incoming connection
     fn accept(&mut self, src_cid: u64, src_port: u32, dst_port: u32) -> Result {
         trace!("Accepting connection");
 
@@ -211,14 +211,14 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         Ok(())
     }
 
-    /// Accepts incomming connections, receives incomming data
+    /// Accepts incoming connections, receives incoming data
     /// Returns a tuple (operation, src_cid, src_port, dst_port, buf_len)
     pub fn handle_next(
         &mut self,
         buf: &mut [u8],
         blocking: bool,
     ) -> Result<(VSockOp, u64, u32, u32, usize)> {
-        trace!("Handle next incomming frame");
+        trace!("Handle next incoming frame");
         let data_buf = unsafe { self.data_buf.as_ref().as_buf() };
         debug_assert!(buf.len() >= data_buf.len());
 
