@@ -221,6 +221,35 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         Ok(())
     }
 
+    fn send_reset(&mut self, src_cid: u64, src_port: u32, dst_port: u32) -> Result {
+        trace!("Resetting connection, src_cid: {}, src_port: {}, dst_port: {}", src_cid, src_port, dst_port);
+
+        unsafe {
+            volwrite!(self.send_header_buf, op, Op::VIRTIO_VSOCK_OP_RST);
+        }
+        let send_header_buf = unsafe { self.send_header_buf.as_mut().as_buf_mut() };
+        self.send_int(dst_port, src_cid, src_port, send_header_buf.len())?;
+
+        trace!("Reseted connection");
+
+        Ok(())
+    }
+
+    pub fn send_shutdown(&mut self, src_cid: u64, src_port: u32, dst_port: u32) -> Result {
+        trace!("Shutting down connection, src_cid: {}, src_port: {}, dst_port: {}", src_cid, src_port, dst_port);
+
+        unsafe {
+            volwrite!(self.send_header_buf, op, Op::VIRTIO_VSOCK_OP_SHUTDOWN);
+            volwrite!(self.send_header_buf, flags, Flags::VIRTIO_VSOCK_SEQ_EOM | Flags::VIRTIO_VSOCK_SEQ_EOR);
+        }
+        let send_header_buf = unsafe { self.send_header_buf.as_mut().as_buf_mut() };
+        self.send_int(dst_port, src_cid, src_port, send_header_buf.len())?;
+
+        trace!("Shutdown connection");
+
+        Ok(())
+    }
+
     /// Accepts incoming connections, receives incoming data
     /// Returns a tuple (operation, src_cid, src_port, dst_port, buf_len)
     pub fn handle_next(
@@ -249,13 +278,21 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
                 self.send_accept(src_cid, src_port, dst_port);
                 Ok((VSockOp::Accepted, src_cid, src_port, dst_port, 0))
             }
-            _ => todo!(),
+            Op::VIRTIO_VSOCK_OP_SHUTDOWN => {
+                self.send_reset(src_cid, src_port, dst_port);
+                Ok((VSockOp::Shutdown, src_cid, src_port, dst_port, 0))
+            }
+            Op::VIRTIO_VSOCK_OP_RST => {
+                Ok((VSockOp::Shutdown, src_cid, src_port, dst_port, 0))
+            }
+            op => todo!("{:?}", op),
         }
     }
 }
 
 pub enum VSockOp {
     Accepted,
+    Shutdown,
     DataFrame,
     WouldBlock,
 }
