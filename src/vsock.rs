@@ -8,8 +8,7 @@ use core::hint::spin_loop;
 use core::ptr::NonNull;
 use log::*;
 
-// TODO: ( PAGE_SIZE - size_of::<Header>() * 2 ) / 2
-pub const SEND_RECV_DATA_BUF_SIZE: usize = 0x700;
+pub const SEND_RECV_DATA_BUF_SIZE: usize = PAGE_SIZE;
 const ASSUMED_HEADER_MAX_SIZE: usize = 0x100;
 
 #[repr(transparent)]
@@ -66,24 +65,29 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
 
         transport.finish_init();
 
-        // Allocate a single page for the header buffer. This is used during send and recv.
+        // Allocate a dma page for the send buffer
         let dma_page = H::dma_alloc(1);
         let vaddr_dma_page = H::phys_to_virt(dma_page);
         let send_data_buf =
             NonNull::new(vaddr_dma_page as *mut DataBuf).expect("Allocation of data buffer failed");
-        let recv_data_buf = NonNull::new((vaddr_dma_page + size_of::<DataBuf>()) as *mut DataBuf)
-            .expect("Allocation of data buffer failed");
+        // Allocate a dma page for the recv buffer
+        let dma_page = H::dma_alloc(1);
+        let vaddr_dma_page = H::phys_to_virt(dma_page);
+        let recv_data_buf =
+            NonNull::new(vaddr_dma_page as *mut DataBuf).expect("Allocation of data buffer failed");
 
+        // Assert our assumed header upper bound is correct
         assert!(size_of::<Header>() <= ASSUMED_HEADER_MAX_SIZE);
+        // Allocate a dma page for the header buffers for send and recv
+        let dma_page = H::dma_alloc(1);
+        let vaddr_dma_page = H::phys_to_virt(dma_page);
         // We assume the header size here because the assigned DMA memory must be correctly alligned and the header size is unknown,
         // but an upper cap is required for all the buffers to fit into one DMA page
-        let send_header_buf =
-            NonNull::new((vaddr_dma_page + size_of::<DataBuf>() * 2) as *mut Header)
+        let send_header_buf = NonNull::new(vaddr_dma_page as *mut Header)
+            .expect("Allocation of header buffer failed");
+        let recv_header_buf =
+            NonNull::new((vaddr_dma_page + ASSUMED_HEADER_MAX_SIZE) as *mut Header)
                 .expect("Allocation of header buffer failed");
-        let recv_header_buf = NonNull::new(
-            (vaddr_dma_page + size_of::<DataBuf>() * 2 + ASSUMED_HEADER_MAX_SIZE) as *mut Header,
-        )
-        .expect("Allocation of header buffer failed");
 
         Ok(VirtIOVsock {
             transport,
@@ -181,7 +185,8 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
         }
 
         let send_data_buf = unsafe { self.send_data_buf.as_ref().as_buf() };
-        self.send_queue.add(&[send_header_buf, send_data_buf], &[])?;
+        self.send_queue
+            .add(&[send_header_buf, send_data_buf], &[])?;
         self.transport.notify(QUEUE_TRANSMIT);
         while !self.send_queue.can_pop() {
             spin_loop();
@@ -222,7 +227,12 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
     }
 
     fn send_reset(&mut self, src_cid: u64, src_port: u32, dst_port: u32) -> Result {
-        trace!("Resetting connection, src_cid: {}, src_port: {}, dst_port: {}", src_cid, src_port, dst_port);
+        trace!(
+            "Resetting connection, src_cid: {}, src_port: {}, dst_port: {}",
+            src_cid,
+            src_port,
+            dst_port
+        );
 
         unsafe {
             volwrite!(self.send_header_buf, op, Op::VIRTIO_VSOCK_OP_RST);
@@ -236,11 +246,20 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
     }
 
     pub fn send_shutdown(&mut self, src_cid: u64, src_port: u32, dst_port: u32) -> Result {
-        trace!("Shutting down connection, src_cid: {}, src_port: {}, dst_port: {}", src_cid, src_port, dst_port);
+        trace!(
+            "Shutting down connection, src_cid: {}, src_port: {}, dst_port: {}",
+            src_cid,
+            src_port,
+            dst_port
+        );
 
         unsafe {
             volwrite!(self.send_header_buf, op, Op::VIRTIO_VSOCK_OP_SHUTDOWN);
-            volwrite!(self.send_header_buf, flags, Flags::VIRTIO_VSOCK_SEQ_EOM | Flags::VIRTIO_VSOCK_SEQ_EOR);
+            volwrite!(
+                self.send_header_buf,
+                flags,
+                Flags::VIRTIO_VSOCK_SEQ_EOM | Flags::VIRTIO_VSOCK_SEQ_EOR
+            );
         }
         let send_header_buf = unsafe { self.send_header_buf.as_mut().as_buf_mut() };
         self.send_int(dst_port, src_cid, src_port, send_header_buf.len())?;
@@ -282,9 +301,7 @@ impl<H: Hal, T: Transport> VirtIOVsock<H, T> {
                 self.send_reset(src_cid, src_port, dst_port);
                 Ok((VSockOp::Shutdown, src_cid, src_port, dst_port, 0))
             }
-            Op::VIRTIO_VSOCK_OP_RST => {
-                Ok((VSockOp::Shutdown, src_cid, src_port, dst_port, 0))
-            }
+            Op::VIRTIO_VSOCK_OP_RST => Ok((VSockOp::Shutdown, src_cid, src_port, dst_port, 0)),
             op => todo!("{:?}", op),
         }
     }
